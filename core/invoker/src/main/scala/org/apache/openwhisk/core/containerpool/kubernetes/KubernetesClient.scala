@@ -148,7 +148,7 @@ class KubernetesClient(
     val start = transid.started(
       this,
       LoggingMarkers.INVOKER_KUBEAPI_CMD("create"),
-      s"launching pod $name (image:$image, mem: ${memory.toMB}) (timeout: ${config.timeouts.run.toSeconds}s)",
+      s"launching pod $name (image:$image, mem: ${memory.toMB}, millicpus: ${config.cpuScaling.cpu}, max-millicpus: ${config.cpuScaling.maxMillicpus}) (timeout: ${config.timeouts.run.toSeconds}s)",
       logLevel = akka.event.Logging.InfoLevel)
 
     //create the pod; catch any failure to end the transaction timer
