@@ -58,6 +58,31 @@ func Main(obj map[string]interface{}) map[string]interface{} {
 }
 ```
 
+An action supports not only a JSON object but also a JSON array as a return value.
+
+It would be a simple example that uses an array as a return value:
+
+```go
+package main
+// Main is the function implementing the action
+func Main(event map[string]interface{}) []interface{} {
+        result := []interface{}{"a", "b"}
+        return result
+}
+```
+
+you can also create a sequence action with actions accepting an array param and returning an array result.
+
+You can easily figure out the parameters with the following example:
+
+```go
+package main
+// Main is the function implementing the action
+func Main(obj []interface{}) []interface{} {
+        return obj
+}
+```
+
 You can deploy it with just:
 
 ```
@@ -191,11 +216,11 @@ Here a `Makefile` is helpful. Check the [examples](https://github.com/apache/ope
 
 You can also use just the `openwhisk/actionloop` as runtime, it is smaller.
 
-<a name="vscode">
+<a name="vscode"/>
 
 ## Using VsCode
 
-If you are using [VsCode[(https://code.visualstudio.com/) as your Go development environment with the [VsCode Go](https://marketplace.visualstudio.com/items?itemName=ms-vscode.Go) support, without errors and with completion working you need to:
+If you are using [VsCode](https://code.visualstudio.com/) as your Go development environment with the [VsCode Go](https://marketplace.visualstudio.com/items?itemName=ms-vscode.Go) support, without errors and with completion working you need to:
 
 - enable the option `go.inferGopath`
 - place all your sources in a `src` folder

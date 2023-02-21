@@ -1,8 +1,26 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.openwhisk.core.scheduler.queue
 
 import akka.actor.{Actor, ActorSystem, Props}
 import org.apache.openwhisk.common.Logging
 import org.apache.openwhisk.core.entity.FullyQualifiedEntityName
+import org.apache.openwhisk.core.scheduler.SchedulingConfig
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success}
@@ -10,8 +28,10 @@ import scala.util.{Failure, Success}
 class SchedulingDecisionMaker(
   invocationNamespace: String,
   action: FullyQualifiedEntityName,
-  StaleThreshold: Double = 100.0)(implicit val actorSystem: ActorSystem, ec: ExecutionContext, logging: Logging)
+  schedulingConfig: SchedulingConfig)(implicit val actorSystem: ActorSystem, ec: ExecutionContext, logging: Logging)
     extends Actor {
+
+  private val staleThreshold: Double = schedulingConfig.staleThreshold.toMillis.toDouble
 
   override def receive: Receive = {
     case msg: QueueSnapshot =>
@@ -38,6 +58,7 @@ class SchedulingDecisionMaker(
       inProgressContainerCountInNs,
       averageDuration,
       limit,
+      maxActionConcurrency,
       stateName,
       _) = snapshot
     val totalContainers = existing + inProgress
@@ -50,7 +71,17 @@ class SchedulingDecisionMaker(
         case _        => Future.successful(DecisionResults(Pausing, 0))
       }
     } else {
-      val capacity = limit - existingContainerCountInNs - inProgressContainerCountInNs
+      val capacity = if (schedulingConfig.allowOverProvisionBeforeThrottle && totalContainers == 0) {
+        // if space available within the over provision ratio amount above namespace limit, create one container for new
+        // action so namespace traffic can attempt to re-balance without blocking entire action
+        if ((ceiling(limit * schedulingConfig.namespaceOverProvisionBeforeThrottleRatio) - existingContainerCountInNs - inProgressContainerCountInNs) > 0) {
+          1
+        } else {
+          0
+        }
+      } else {
+        limit - existingContainerCountInNs - inProgressContainerCountInNs
+      }
       if (capacity <= 0) {
         stateName match {
 
@@ -59,12 +90,17 @@ class SchedulingDecisionMaker(
            *
            * However, if the container exists(totalContainers != 0), the activation is not treated as a failure and the activation is delivered to the container.
            */
-          case Running =>
+          case Running
+              if !schedulingConfig.allowOverProvisionBeforeThrottle || (schedulingConfig.allowOverProvisionBeforeThrottle && ceiling(
+                limit * schedulingConfig.namespaceOverProvisionBeforeThrottleRatio) - existingContainerCountInNs - inProgressContainerCountInNs <= 0) =>
             logging.info(
               this,
               s"there is no capacity activations will be dropped or throttled, (availableMsg: $availableMsg totalContainers: $totalContainers, limit: $limit, namespaceContainers: ${existingContainerCountInNs}, namespaceInProgressContainer: ${inProgressContainerCountInNs}) [$invocationNamespace:$action]")
             Future.successful(DecisionResults(EnableNamespaceThrottling(dropMsg = totalContainers == 0), 0))
-
+          case NamespaceThrottled
+              if schedulingConfig.allowOverProvisionBeforeThrottle && ceiling(
+                limit * schedulingConfig.namespaceOverProvisionBeforeThrottleRatio) - existingContainerCountInNs - inProgressContainerCountInNs > 0 =>
+            Future.successful(DecisionResults(DisableNamespaceThrottling, 0))
           // do nothing
           case _ =>
             // no need to print any messages if the state is already NamespaceThrottled
@@ -102,7 +138,7 @@ class SchedulingDecisionMaker(
           // but it is a kind of trade-off and we place latency on top of over-provisioning
           case (Running, None) if staleActivationNum > 0 =>
             // we can safely get the value as we already checked the existence
-            val num = staleActivationNum - inProgress
+            val num = ceiling(staleActivationNum.toDouble / maxActionConcurrency.toDouble) - inProgress
             // if it tries to create more containers than existing messages, we just create shortage
             val actualNum = if (num > availableMsg) availableMsg else num
             addServersIfPossible(
@@ -115,41 +151,44 @@ class SchedulingDecisionMaker(
               staleActivationNum,
               0.0,
               Running)
-
-          case (Running, Some(duration)) if staleActivationNum > 0 =>
-            // we can safely get the value as we already checked the existence
-            val containerThroughput = StaleThreshold / duration
-            val num = ceiling(availableMsg.toDouble / containerThroughput)
-            // if it tries to create more containers than existing messages, we just create shortage
-            val actualNum = (if (num > availableMsg) availableMsg else num) - inProgress
-            addServersIfPossible(
-              existing,
-              inProgress,
-              containerThroughput,
-              availableMsg,
-              capacity,
-              actualNum,
-              staleActivationNum,
-              duration,
-              Running)
-
           // need more containers and a message is already processed
           case (Running, Some(duration)) =>
             // we can safely get the value as we already checked the existence
-            val containerThroughput = StaleThreshold / duration
+            val containerThroughput = (staleThreshold / duration) * maxActionConcurrency
             val expectedTps = containerThroughput * (existing + inProgress)
+            val availableNonStaleActivations = availableMsg - staleActivationNum
 
-            if (availableMsg >= expectedTps && existing + inProgress < availableMsg) {
-              val num = ceiling((availableMsg / containerThroughput) - existing - inProgress)
+            var staleContainerProvision = 0
+            if (staleActivationNum > 0) {
+              val num = ceiling(staleActivationNum.toDouble / containerThroughput)
               // if it tries to create more containers than existing messages, we just create shortage
-              val actualNum = if (num + totalContainers > availableMsg) availableMsg - totalContainers else num
+              staleContainerProvision = (if (num > staleActivationNum) staleActivationNum else num) - inProgress
+            }
+
+            if (availableNonStaleActivations >= expectedTps && existing + inProgress < availableNonStaleActivations) {
+              val num = ceiling((availableNonStaleActivations / containerThroughput) - existing - inProgress)
+              // if it tries to create more containers than existing messages, we just create shortage
+              val actualNum =
+                if (num + totalContainers > availableNonStaleActivations) availableNonStaleActivations - totalContainers
+                else num
               addServersIfPossible(
                 existing,
                 inProgress,
                 containerThroughput,
                 availableMsg,
                 capacity,
-                actualNum,
+                actualNum + staleContainerProvision,
+                staleActivationNum,
+                duration,
+                Running)
+            } else if (staleContainerProvision > 0) {
+              addServersIfPossible(
+                existing,
+                inProgress,
+                containerThroughput,
+                availableMsg,
+                capacity,
+                staleContainerProvision,
                 staleActivationNum,
                 duration,
                 Running)
@@ -163,10 +202,10 @@ class SchedulingDecisionMaker(
           // this case is for that as a last resort.
           case (Removing, Some(duration)) if staleActivationNum > 0 =>
             // we can safely get the value as we already checked the existence
-            val containerThroughput = StaleThreshold / duration
-            val num = ceiling(availableMsg.toDouble / containerThroughput)
+            val containerThroughput = (staleThreshold / duration) * maxActionConcurrency
+            val num = ceiling(staleActivationNum.toDouble / containerThroughput)
             // if it tries to create more containers than existing messages, we just create shortage
-            val actualNum = (if (num > availableMsg) availableMsg else num) - inProgress
+            val actualNum = (if (num > staleActivationNum) staleActivationNum else num) - inProgress
             addServersIfPossible(
               existing,
               inProgress,
@@ -181,7 +220,7 @@ class SchedulingDecisionMaker(
           // same with the above case but no duration exist.
           case (Removing, None) if staleActivationNum > 0 =>
             // we can safely get the value as we already checked the existence
-            val num = staleActivationNum - inProgress
+            val num = ceiling(staleActivationNum.toDouble / maxActionConcurrency.toDouble) - inProgress
             // if it tries to create more containers than existing messages, we just create shortage
             val actualNum = if (num > availableMsg) availableMsg else num
             addServersIfPossible(
@@ -235,10 +274,10 @@ class SchedulingDecisionMaker(
 }
 
 object SchedulingDecisionMaker {
-  def props(invocationNamespace: String, action: FullyQualifiedEntityName, StaleThreshold: Double = 100.0)(
+  def props(invocationNamespace: String, action: FullyQualifiedEntityName, schedulingConfig: SchedulingConfig)(
     implicit actorSystem: ActorSystem,
     ec: ExecutionContext,
     logging: Logging): Props = {
-    Props(new SchedulingDecisionMaker(invocationNamespace, action, StaleThreshold))
+    Props(new SchedulingDecisionMaker(invocationNamespace, action, schedulingConfig))
   }
 }

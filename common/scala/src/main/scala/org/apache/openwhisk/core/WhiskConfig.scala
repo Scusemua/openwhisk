@@ -203,6 +203,7 @@ object WhiskConfig {
 object ConfigKeys {
   val cluster = "whisk.cluster"
   val loadbalancer = "whisk.loadbalancer"
+  val fpcLoadBalancer = "whisk.loadbalancer.fpc"
   val fraction = "whisk.fraction"
   val buildInformation = "whisk.info"
 
@@ -221,6 +222,15 @@ object ConfigKeys {
   val timeLimit = "whisk.time-limit"
   val logLimit = "whisk.log-limit"
   val concurrencyLimit = "whisk.concurrency-limit"
+  val parameterSizeLimit = "whisk.parameter-size-limit"
+
+  val namespaceMemoryLimit = "whisk.namespace-default-limit.memory"
+  val namespaceTimeLimit = "whisk.namespace-default-limit.time-limit"
+  val namespaceLogLimit = "whisk.namespace-default-limit.log-limit"
+  val namespaceConcurrencyLimit = "whisk.namespace-default-limit.concurrency-limit"
+  val namespaceParameterSizeLimit = "whisk.namespace-default-limit.parameter-size-limit"
+  val namespaceActivationPayloadLimit = "whisk.namespace-default-limit.activation.payload"
+
   val activation = "whisk.activation"
   val userEvents = "whisk.user-events"
 
@@ -286,7 +296,10 @@ object ConfigKeys {
   val sharedPackageExecuteOnly = s"whisk.shared-packages-execute-only"
   val swaggerUi = "whisk.swagger-ui"
 
+  /* DEPRECATED: disableStoreResult is deprecated for storeBlockingResultLevel */
   val disableStoreResult = s"$activation.disable-store-result"
+  val storeBlockingResultLevel = s"$activation.store-blocking-result-level"
+  val storeNonBlockingResultLevel = s"$activation.store-non-blocking-result-level"
   val unstoredLogsEnabled = s"$activation.unstored-logs-enabled"
 
   val apacheClientConfig = "whisk.apache-client"
@@ -297,11 +310,26 @@ object ConfigKeys {
 
   val schedulerGrpcService = "whisk.scheduler.grpc"
   val schedulerMaxPeek = "whisk.scheduler.max-peek"
+  val schedulerScheduling = "whisk.scheduler.scheduling"
   val schedulerQueue = "whisk.scheduler.queue"
   val schedulerQueueManager = "whisk.scheduler.queue-manager"
-  val schedulerInProgressJobRetentionSecond = "whisk.scheduler.in-progress-job-retention"
+  val schedulerInProgressJobRetention = "whisk.scheduler.in-progress-job-retention"
+  val schedulerBlackboxMultiple = "whisk.scheduler.blackbox-multiple"
+  val schedulerStaleThreshold = "whisk.scheduler.stale-threshold"
 
   val whiskClusterName = "whisk.cluster.name"
 
-  val dataManagementServiceRetryInterval = "whisk.scheduler.data-management-service.retryInterval"
+  val dataManagementServiceRetryInterval = "whisk.scheduler.data-management-service.retry-interval"
+
+  val whiskControllerUsername = "whisk.controller.username"
+  val whiskControllerPassword = "whisk.controller.password"
+
+  val whiskSchedulerUsername = "whisk.scheduler.username"
+  val whiskSchedulerPassword = "whisk.scheduler.password"
+
+  val whiskInvokerUsername = "whisk.invoker.username"
+  val whiskInvokerPassword = "whisk.invoker.password"
+
+  val invokerResourceTags = "whisk.invoker.resource.tags"
+  val invokerDedicatedNamespaces = "whisk.invoker.dedicated.namespaces"
 }

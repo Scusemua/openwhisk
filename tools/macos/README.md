@@ -55,7 +55,7 @@ brew install gnu-tar
 # install pip
 sudo easy_install pip
 # install script prerequisites
-pip install docker==5.0.0 ansible==4.1.0 jinja2==3.0.1 couchdb==1.2 httplib2==0.19.1 requests==2.25.1 six=1.16.0
+pip install docker==5.0.0 ansible==4.1.0 jinja2==3.0.1 couchdb==1.2 httplib2==0.19.1 requests==2.25.1 six==1.16.0
 ```
 
 Make sure you correctly configure the environment variable $JAVA_HOME.
@@ -75,7 +75,7 @@ Follow instructions in [ansible/README.md](../../ansible/README.md)
 #### Using brew
 
 ```bash
-brew install wsk 
+brew install wsk
 wsk property set --apihost https://localhost
 wsk property set --auth `cat ansible/files/auth.guest`
 ```
@@ -109,9 +109,9 @@ ansible-playbook wipe.yml
 ansible-playbook properties.yml
 ```
 
-To run the unit tests execute the command bellow from the project's root folder: 
+To run the unit tests execute the command bellow from the project's root folder:
 ```bash
 # go back to project's root folder
 cd ../
-./gradlew -PtestSetName="REQUIRE_ONLY_DB" :tests:testCoverageLean 
+./gradlew -PtestSetName="REQUIRE_ONLY_DB" :tests:testCoverageLean
 ```

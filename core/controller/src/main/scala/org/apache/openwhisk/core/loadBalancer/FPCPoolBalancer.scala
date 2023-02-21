@@ -1,15 +1,31 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.openwhisk.core.loadBalancer
 
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.atomic.LongAdder
-
 import akka.actor.{Actor, ActorRef, ActorRefFactory, ActorSystem, Cancellable, Props}
 import akka.event.Logging.InfoLevel
 import akka.pattern.ask
 import akka.util.Timeout
-import org.apache.kafka.clients.producer.RecordMetadata
 import org.apache.openwhisk.common.InvokerState.{Healthy, Offline, Unhealthy}
+import org.apache.openwhisk.common.LoggingMarkers._
 import org.apache.openwhisk.common._
 import org.apache.openwhisk.core.connector._
 import org.apache.openwhisk.core.controller.Controller
@@ -34,6 +50,8 @@ import scala.concurrent.{ExecutionContext, ExecutionContextExecutor, Future, Pro
 import scala.language.postfixOps
 import scala.util.{Failure, Random, Success, Try}
 
+case class FPCPoolBalancerConfig(usePerMinThrottle: Boolean)
+
 class FPCPoolBalancer(config: WhiskConfig,
                       controllerInstance: ControllerInstanceId,
                       etcdClient: EtcdClient,
@@ -46,7 +64,8 @@ class FPCPoolBalancer(config: WhiskConfig,
     extends LoadBalancer {
 
   private implicit val executionContext: ExecutionContext = actorSystem.dispatcher
-  private implicit val requestTimeout: Timeout = Timeout(5.seconds)
+  // This value is given according to the total waiting time at QueueManager for a new queue to be created.
+  private implicit val requestTimeout: Timeout = Timeout(8.seconds)
 
   private val entityStore = WhiskEntityStore.datastore()
 
@@ -155,7 +174,7 @@ class FPCPoolBalancer(config: WhiskConfig,
     if (retryCount >= 0)
       scheduler
         .getRemoteRef(QueueManager.actorName)
-        .ask(CreateQueue(invocationNamespace, fullyQualifiedEntityName.copy(binding = None), revision, actionMetaData))
+        .ask(CreateQueue(invocationNamespace, fullyQualifiedEntityName, revision, actionMetaData))
         .mapTo[CreateQueueResponse]
         .onComplete {
           case Success(_) =>
@@ -249,7 +268,7 @@ class FPCPoolBalancer(config: WhiskConfig,
   /** 3. Send the activation to the kafka */
   private def sendActivationToKafka(producer: MessageProducer,
                                     msg: ActivationMessage,
-                                    topic: String): Future[RecordMetadata] = {
+                                    topic: String): Future[ResultMetadata] = {
     implicit val transid: TransactionId = msg.transid
 
     MetricEmitter.emitCounterMetric(LoggingMarkers.LOADBALANCER_ACTIVATION_START)
@@ -260,7 +279,7 @@ class FPCPoolBalancer(config: WhiskConfig,
         transid.finished(
           this,
           start,
-          s"posted to ${status.topic()}[${status.partition()}][${status.offset()}]",
+          s"posted to ${status.topic}[${status.partition}][${status.offset}]",
           logLevel = InfoLevel)
       case Failure(_) => transid.failed(this, start, s"error on posting to topic $topic")
     }
@@ -335,6 +354,16 @@ class FPCPoolBalancer(config: WhiskConfig,
     }
   }
 
+  // Singletons for counter metrics related to completion acks
+  protected val LOADBALANCER_COMPLETION_ACK_REGULAR =
+    LoggingMarkers.LOADBALANCER_COMPLETION_ACK(controllerInstance, RegularCompletionAck)
+  protected val LOADBALANCER_COMPLETION_ACK_FORCED =
+    LoggingMarkers.LOADBALANCER_COMPLETION_ACK(controllerInstance, ForcedCompletionAck)
+  protected val LOADBALANCER_COMPLETION_ACK_REGULAR_AFTER_FORCED =
+    LoggingMarkers.LOADBALANCER_COMPLETION_ACK(controllerInstance, RegularAfterForcedCompletionAck)
+  protected val LOADBALANCER_COMPLETION_ACK_FORCED_AFTER_REGULAR =
+    LoggingMarkers.LOADBALANCER_COMPLETION_ACK(controllerInstance, ForcedAfterRegularCompletionAck)
+
   /** Process the completion ack and update the state */
   protected[loadBalancer] def processCompletion(aid: ActivationId,
                                                 tid: TransactionId,
@@ -359,14 +388,17 @@ class FPCPoolBalancer(config: WhiskConfig,
           // the active ack is received as expected, and processing that message removed the promise
           // from the corresponding map
           logging.info(this, s"received completion ack for '$aid', system error=$isSystemError")(tid)
+          MetricEmitter.emitCounterMetric(LOADBALANCER_COMPLETION_ACK_REGULAR)
         } else {
           logging.error(this, s"Failed to invoke action ${aid.toString}, error: timeout waiting for the active ack")
+          MetricEmitter.emitCounterMetric(LOADBALANCER_COMPLETION_ACK_FORCED)
 
           // the entry has timed out; if the active ack is still around, remove its entry also
           // and complete the promise with a failure if necessary
           activationPromises
             .remove(aid)
-            .foreach(_.tryFailure(new Throwable("Activation entry has timed out, no completion or active ack received yet")))
+            .foreach(
+              _.tryFailure(new Throwable("Activation entry has timed out, no completion or active ack received yet")))
         }
 
       // Active acks that are received here are strictly from user actions - health actions are not part of
@@ -377,11 +409,13 @@ class FPCPoolBalancer(config: WhiskConfig,
         // Logging this condition as a warning because the invoker processed the activation and sent a completion
         // message - but not in time.
         logging.warn(this, s"received completion ack for '$aid' which has no entry, system error=$isSystemError")(tid)
+        MetricEmitter.emitCounterMetric(LOADBALANCER_COMPLETION_ACK_REGULAR_AFTER_FORCED)
       case None =>
         // The entry has already been removed by a completion ack. This part of the code is reached by the timeout and can
         // happen if completion ack and timeout happen roughly at the same time (the timeout was triggered before the completion
         // ack canceled the timer). As the completion ack is already processed we don't have to do anything here.
         logging.debug(this, s"forced completion ack for '$aid' which has no entry")(tid)
+        MetricEmitter.emitCounterMetric(LOADBALANCER_COMPLETION_ACK_FORCED_AFTER_REGULAR)
     }
   }
 
@@ -599,6 +633,27 @@ class FPCPoolBalancer(config: WhiskConfig,
     }
   }
 
+  def emitMetrics() = {
+    invokerHealth().map(invokers => {
+      MetricEmitter.emitGaugeMetric(HEALTHY_INVOKERS, invokers.count(_.status == Healthy))
+      MetricEmitter.emitGaugeMetric(UNHEALTHY_INVOKERS, invokers.count(_.status == Unhealthy))
+      MetricEmitter.emitGaugeMetric(OFFLINE_INVOKERS, invokers.count(_.status == Offline))
+      // Add both user memory and busy memory because user memory represents free memory in this case
+      MetricEmitter.emitGaugeMetric(INVOKER_TOTALMEM, invokers.foldLeft(0L) { (total, curr) =>
+        if (curr.status.isUsable) {
+          curr.id.userMemory.toMB + curr.id.busyMemory.getOrElse(ByteSize(0, SizeUnits.BYTE)).toMB + total
+        } else {
+          total
+        }
+      })
+      MetricEmitter.emitGaugeMetric(LOADBALANCER_ACTIVATIONS_INFLIGHT(controllerInstance), totalActivations.longValue)
+      MetricEmitter
+        .emitGaugeMetric(LOADBALANCER_MEMORY_INFLIGHT(controllerInstance, ""), totalActivationMemory.longValue)
+    })
+  }
+
+  actorSystem.scheduler.scheduleAtFixedRate(10.seconds, 10.seconds)(() => emitMetrics())
+
   /** Gets the number of in-flight activations for a specific user. */
   override def activeActivationsFor(namespace: UUID): Future[Int] =
     Future.successful(activationsPerNamespace.get(namespace).map(_.intValue()).getOrElse(0))
@@ -608,8 +663,9 @@ class FPCPoolBalancer(config: WhiskConfig,
     Future.successful(activationsPerController.get(ControllerInstanceId(controller)).map(_.intValue()).getOrElse(0))
 
   /** Gets the in-flight activations */
-  override def activeActivationsByController: Future[List[ActivationId]] =
-    Future.successful(activationSlots.keySet.toList)
+  override def activeActivationsByController: Future[List[(String, String)]] =
+    Future.successful(
+      activationSlots.values.map(entry => (entry.id.asString, entry.fullyQualifiedEntityName.toString)).toList)
 
   /** Gets the number of in-flight activations for a specific invoker. */
   override def activeActivationsByInvoker(invoker: String): Future[Int] = Future.successful(0)
@@ -659,7 +715,7 @@ object FPCPoolBalancer extends LoadBalancerProvider {
       }
     }
 
-    val etcd = EtcdClient(loadConfigOrThrow[EtcdConfig](ConfigKeys.etcd).hosts)
+    val etcd = EtcdClient(loadConfigOrThrow[EtcdConfig](ConfigKeys.etcd))
 
     new FPCPoolBalancer(whiskConfig, instance, etcd, feedFactory)
   }

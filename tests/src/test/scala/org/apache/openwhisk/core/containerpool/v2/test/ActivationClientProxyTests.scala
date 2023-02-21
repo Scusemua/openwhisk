@@ -19,12 +19,13 @@ package org.apache.openwhisk.core.containerpool.v2.test
 
 import akka.Done
 import akka.actor.FSM.{CurrentState, SubscribeTransitionCallBack, Transition}
+import akka.actor.Status.Failure
 import akka.actor.{ActorRef, ActorSystem}
 import akka.grpc.internal.ClientClosedException
 import akka.testkit.{ImplicitSender, TestKit, TestProbe}
 import common.StreamLogging
 import io.grpc.StatusRuntimeException
-import org.apache.openwhisk.common.TransactionId
+import org.apache.openwhisk.common.{GracefulShutdown, TransactionId}
 import org.apache.openwhisk.core.connector.ActivationMessage
 import org.apache.openwhisk.core.containerpool.ContainerId
 import org.apache.openwhisk.core.containerpool.v2._
@@ -37,9 +38,9 @@ import org.apache.openwhisk.grpc
 import org.apache.openwhisk.grpc.{ActivationServiceClient, FetchRequest, RescheduleRequest, RescheduleResponse}
 import org.junit.runner.RunWith
 import org.scalamock.scalatest.MockFactory
+import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.junit.JUnitRunner
 import org.scalatest.{BeforeAndAfterAll, FlatSpecLike, Matchers}
-import org.scalatest.concurrent.ScalaFutures
 
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.Future
@@ -103,7 +104,7 @@ class ActivationClientProxyTests
 
     machine ! StartClient
 
-    probe.expectMsg(ClientCreationCompleted())
+    probe.expectMsg(ClientCreationCompleted)
     probe.expectMsg(Transition(machine, ClientProxyUninitialized, ClientProxyReady))
   }
 
@@ -124,6 +125,9 @@ class ActivationClientProxyTests
 
     machine ! StartClient
 
+    probe.expectMsgPF() {
+      case Failure(t) => t.getMessage shouldBe "The number of client creation retries has been exceeded."
+    }
     probe.expectMsg(Transition(machine, ClientProxyUninitialized, ClientProxyRemoving))
     probe.expectMsg(ClientClosed)
 
@@ -199,19 +203,34 @@ class ActivationClientProxyTests
     val client = (_: String, _: FullyQualifiedEntityName, _: String, _: Int, _: Boolean) =>
       Future(MockActivationServiceClient(fetch))
 
-    val probe = TestProbe()
+    val parentProbe = TestProbe()
+    val selfProbe = TestProbe()
     val machine =
-      probe.childActorOf(
+      parentProbe.childActorOf(
         ActivationClientProxy
           .props(invocationNamespace.asString, fqn, rev, schedulerHost, rpcPort, containerId, client))
-    registerCallback(machine, probe)
-    ready(machine, probe)
+
+    // set up watch of client proxy fsm
+    machine ! SubscribeTransitionCallBack(selfProbe.ref)
+    selfProbe.expectMsg(CurrentState(machine, ClientProxyUninitialized))
+    selfProbe watch machine
+
+    // wait for client proxy to be ready
+    machine ! StartClient
+    parentProbe.expectMsg(ClientCreationCompleted)
+    selfProbe.expectMsg(Transition(machine, ClientProxyUninitialized, ClientProxyReady))
 
     machine ! RequestActivation()
-    probe.expectMsg(Transition(machine, ClientProxyReady, ClientProxyRemoving))
-    probe.expectMsg(ClientClosed)
 
-    probe expectTerminated machine
+    // next two events can happen in any order
+    selfProbe.expectMsg(Transition(machine, ClientProxyReady, ClientProxyRemoving))
+    parentProbe.expectMsgPF() {
+      case Failure(t) => t.getMessage.contains(s"action version does not match") shouldBe true
+    }
+
+    parentProbe.expectMsg(ClientClosed)
+
+    selfProbe expectTerminated machine
   }
 
   it should "retry to request activation message when scheduler response no activation message" in within(timeout) {
@@ -319,7 +338,11 @@ class ActivationClientProxyTests
     ready(machine, probe)
 
     machine ! RequestActivation()
+    probe.expectMsgPF() {
+      case Failure(t) => t.isInstanceOf[ClientClosedException] shouldBe true
+    }
     probe.expectMsg(Transition(machine, ClientProxyReady, ClientProxyRemoving))
+
     probe.expectMsg(ClientClosed)
 
     probe expectTerminated machine
@@ -343,13 +366,16 @@ class ActivationClientProxyTests
     ready(machine, probe)
 
     machine ! RequestActivation()
+    probe.expectMsgPF() {
+      case Failure(t) => t.getMessage.contains("Unknown exception") shouldBe true
+    }
     probe.expectMsg(Transition(machine, ClientProxyReady, ClientProxyRemoving))
     probe.expectMsg(ClientClosed)
 
     probe expectTerminated machine
   }
 
-  it should "be closed when it receives a CloseClientProxy message for a normal timeout case" in within(timeout) {
+  it should "be closed when it receives a GracefulShutdown message for a normal timeout case" in within(timeout) {
     val fetch = (_: FetchRequest) => Future(grpc.FetchResponse(AResponse(Right(message)).serialize))
     val activationClient = MockActivationServiceClient(fetch)
     val client = (_: String, _: FullyQualifiedEntityName, _: String, _: Int, _: Boolean) => Future(activationClient)
@@ -362,14 +388,14 @@ class ActivationClientProxyTests
     registerCallback(machine, probe)
     ready(machine, probe)
 
-    machine ! CloseClientProxy
-    awaitAssert(activationClient.isClosed shouldBe true)
+    machine ! GracefulShutdown
 
     probe.expectMsg(Transition(machine, ClientProxyReady, ClientProxyRemoving))
 
     machine ! RequestActivation()
 
     probe expectMsg ClientClosed
+    awaitAssert(activationClient.isClosed shouldBe true)
     probe expectTerminated machine
   }
 
@@ -426,7 +452,7 @@ class ActivationClientProxyTests
 
   def ready(machine: ActorRef, probe: TestProbe) = {
     machine ! StartClient
-    probe.expectMsg(ClientCreationCompleted())
+    probe.expectMsg(ClientCreationCompleted)
     probe.expectMsg(Transition(machine, ClientProxyUninitialized, ClientProxyReady))
   }
 

@@ -47,12 +47,12 @@ case class JobEntry(action: FullyQualifiedEntityName, timer: Cancellable)
 
 class CreationJobManager(feedFactory: (ActorRefFactory, String, String, Int, Array[Byte] => Future[Unit]) => ActorRef,
                          schedulerInstanceId: SchedulerInstanceId,
-                         dataManagementService: ActorRef)(implicit actorSystem: ActorSystem, logging: Logging)
+                         dataManagementService: ActorRef,
+                         baseTimeout: FiniteDuration,
+                         blackboxMultiple: Int)(implicit actorSystem: ActorSystem, logging: Logging)
     extends Actor {
   private implicit val ec: ExecutionContext = actorSystem.dispatcher
-  private val baseTimeout = loadConfigOrThrow[FiniteDuration](ConfigKeys.schedulerInProgressJobRetentionSecond)
   private val retryLimit = 5
-  private val retryDelayTime = 100.milliseconds
 
   /**
    * Store a JobEntry in local to get an alarm for key timeout
@@ -83,7 +83,7 @@ class CreationJobManager(feedFactory: (ActorRefFactory, String, String, Int, Arr
           error,
           reason)) =>
       if (error.isEmpty) {
-        logging.info(this, s"[$creationId] create container successfully")
+        logging.info(this, s"[$action] [$creationId] create container successfully")
         deleteJob(
           invocationNamespace,
           action,
@@ -97,7 +97,7 @@ class CreationJobManager(feedFactory: (ActorRefFactory, String, String, Int, Arr
         if (retryCount >= retryLimit || !error.exists(ContainerCreationError.whiskErrors.contains)) {
           logging.error(
             this,
-            s"[$creationId] Failed to create container $retryCount/$retryLimit times for $cause. Finished creation")
+            s"[$action] [$creationId] Failed to create container $retryCount/$retryLimit times for $cause. Finished creation")
           // Delete from pool after all retries are failed
           deleteJob(
             invocationNamespace,
@@ -109,8 +109,9 @@ class CreationJobManager(feedFactory: (ActorRefFactory, String, String, Int, Arr
           // Reschedule
           logging.error(
             this,
-            s"[$creationId] Failed to create container $retryCount/$retryLimit times for $cause. Started rescheduling")
-          // Add some time interval during retry create container, because etcd put operation needs some time if data inconsistant happens
+            s"[$action] [$creationId] Failed to create container $retryCount/$retryLimit times for $cause. Started rescheduling")
+          // Add some exponential delay time interval during retry create container, because etcd put operation needs some time if data inconsistant happens
+          val retryDelayTime = (scala.math.pow(2, retryCount) * 100).milliseconds
           actorSystem.scheduler.scheduleOnce(retryDelayTime) {
             context.parent ! ReschedulingCreationJob(
               tid,
@@ -152,10 +153,10 @@ class CreationJobManager(feedFactory: (ActorRefFactory, String, String, Int, Arr
     // If there is a JobEntry, delete it.
     creationJobPool
       .remove(creationId)
-      .foreach(entry => {
-        sendState(state)
-        entry.timer.cancel()
-      })
+      .map(entry => entry.timer.cancel())
+
+    // even if there is no entry because of timeout, we still need to send the state to the queue if the queue exists
+    sendState(state)
 
     dataManagementService ! UnregisterData(key)
     Future.successful({})
@@ -176,23 +177,22 @@ class CreationJobManager(feedFactory: (ActorRefFactory, String, String, Int, Arr
                             revision: DocRevision,
                             creationId: CreationId,
                             isBlackbox: Boolean): Cancellable = {
-    val timeout = if (isBlackbox) FiniteDuration(baseTimeout.toSeconds * 3, TimeUnit.SECONDS) else baseTimeout
+    val timeout =
+      if (isBlackbox) FiniteDuration(baseTimeout.toSeconds * blackboxMultiple, TimeUnit.SECONDS) else baseTimeout
     actorSystem.scheduler.scheduleOnce(timeout) {
       logging.warn(
         this,
         s"Failed to create a container for $action(blackbox: $isBlackbox), error: $creationId timed out after $timeout")
       creationJobPool
         .remove(creationId)
-        .foreach(
-          _ =>
-            sendState(
-              FailedCreationJob(
-                creationId,
-                invocationNamespace,
-                action,
-                revision,
-                ContainerCreationError.TimeoutError,
-                s"timeout waiting for the ack of $creationId after $timeout")))
+        .foreach(_ =>
+          sendState(FailedCreationJob(
+            creationId,
+            invocationNamespace,
+            action,
+            revision,
+            ContainerCreationError.TimeoutError,
+            s"[$action] timeout waiting for the ack of $creationId after $timeout")))
       dataManagementService ! UnregisterData(
         inProgressContainer(invocationNamespace, action, revision, schedulerInstanceId, creationId))
     }
@@ -224,8 +224,12 @@ class CreationJobManager(feedFactory: (ActorRefFactory, String, String, Int, Arr
 }
 
 object CreationJobManager {
+  private val baseTimeout = loadConfigOrThrow[FiniteDuration](ConfigKeys.schedulerInProgressJobRetention)
+  private val blackboxMultiple = loadConfigOrThrow[Int](ConfigKeys.schedulerBlackboxMultiple)
+
   def props(feedFactory: (ActorRefFactory, String, String, Int, Array[Byte] => Future[Unit]) => ActorRef,
             schedulerInstanceId: SchedulerInstanceId,
             dataManagementService: ActorRef)(implicit actorSystem: ActorSystem, logging: Logging) =
-    Props(new CreationJobManager(feedFactory, schedulerInstanceId, dataManagementService))
+    Props(
+      new CreationJobManager(feedFactory, schedulerInstanceId, dataManagementService, baseTimeout, blackboxMultiple))
 }

@@ -46,7 +46,7 @@ If you prefer [Docker-machine](https://docs.docker.com/machine/) to [Docker for 
 The remote Docker API is required for collecting logs using the Ansible playbook [logs.yml](logs.yml).
 
 ##### Activate docker0 network (local dev only)
- 
+
 The OpenWhisk deployment via Ansible uses the `docker0` network interface to deploy OpenWhisk and it does not exist on Docker for Mac environment.
 
 An expedient workaround is to add alias for `docker0` network to loopback interface.
@@ -72,9 +72,9 @@ In all instructions, replace `<openwhisk_home>` with the base directory of your 
 
 #### Ansible with pyenv (local dev only)
 
-When using [pyenv](https://github.com/pyenv/pyenv) to manage your versions of python, the [ansible python interpreter](https://docs.ansible.com/ansible/latest/reference_appendices/python_3_support.html) will use your system's default python, which may have a different version. 
+When using [pyenv](https://github.com/pyenv/pyenv) to manage your versions of python, the [ansible python interpreter](https://docs.ansible.com/ansible/latest/reference_appendices/python_3_support.html) will use your system's default python, which may have a different version.
 
-To make sure ansible uses the same version of python which you configured, execute: 
+To make sure ansible uses the same version of python which you configured, execute:
 
 ```bash
 echo -e "\nansible_python_interpreter: `which python`\n" >> ./environments/local/group_vars/all
@@ -87,7 +87,7 @@ up again. To avoid this problem, export the `OPENWHISK_TMP_DIR` variable assigni
 directory before deploying OpenWhisk.
 
 #### Setup
- 
+
 This step should be executed once per development environment.
 It will generate the `hosts` configuration file based on your environment settings.
 
@@ -147,6 +147,77 @@ ansible-playbook -i environments/$ENVIRONMENT prereq.yml
 ```
 
 **Hint:** During playbook execution the `TASK [prereq : check for pip]` can show as failed. This is normal if no pip is installed. The playbook will then move on and install pip on the target machines.
+
+### [Optional] Enable the new scheduler
+
+You can enable the new scheduler of OpenWhisk.
+It will run one more component called "scheduler" and ETCD.
+
+#### Configure service providers for the scheduler
+You can update service providers for the scheduler as follows.
+
+**common/scala/src/main/resources/reference.conf**
+
+If you are using ElasticSearch (recommended) then replace ```NoopDurationCheckerProvider``` with ```ElasticSearchDurationCheckerProvider``` below.
+```
+whisk.spi {
+  ArtifactStoreProvider = org.apache.openwhisk.core.database.CouchDbStoreProvider
+  ActivationStoreProvider = org.apache.openwhisk.core.database.ArtifactActivationStoreProvider
+  MessagingProvider = org.apache.openwhisk.connector.kafka.KafkaMessagingProvider
+  ContainerFactoryProvider = org.apache.openwhisk.core.containerpool.docker.DockerContainerFactoryProvider
+  LogStoreProvider = org.apache.openwhisk.core.containerpool.logging.DockerToActivationLogStoreProvider
+  LoadBalancerProvider = org.apache.openwhisk.core.loadBalancer.FPCPoolBalancer
+  EntitlementSpiProvider = org.apache.openwhisk.core.entitlement.FPCEntitlementProvider
+  AuthenticationDirectiveProvider = org.apache.openwhisk.core.controller.BasicAuthenticationDirective
+  InvokerProvider = org.apache.openwhisk.core.invoker.FPCInvokerReactive
+  InvokerServerProvider = org.apache.openwhisk.core.invoker.FPCInvokerServer
+  DurationCheckerProvider = org.apache.openwhisk.core.scheduler.queue.NoopDurationCheckerProvider
+}
+.
+.
+.
+```
+#### Configure pause grace for the scheduler
+Set the value of pause-grace to 10s by default
+
+**core/invoker/src/main/resources/application.conf**
+```
+  container-proxy {
+    timeouts {
+      # The "unusedTimeout" in the ContainerProxy,
+      #aka 'How long should a container sit idle until we kill it?'
+      idle-container = 10 minutes
+      pause-grace = 10 seconds
+      keeping-duration = 10 minutes
+    }
+  .
+  .
+  .
+```
+
+#### Enable the scheduler
+- Make sure you enable the scheduler by configuring `scheduler_enable`.
+
+**ansible/environments/local/group_vars/all**
+```yaml
+scheduler_enable: true
+```
+
+#### [Optional] Enable ElasticSearch Activation Store
+When you use the new scheduler, it is recommended to use ElasticSearch as an activation store.
+
+**ansible/environments/local/group_vars**
+```yaml
+db_activation_backend: ElasticSearch
+elastic_cluster_name: <your elasticsearch cluster name>
+elastic_protocol: <your elasticsearch protocol>
+elastic_index_pattern: <your elasticsearch index pattern>
+elastic_base_volume: <your elasticsearch volume directory>
+elastic_username: <your elasticsearch username>
+elastic_password: <your elasticsearch username>
+```
+
+You can also refer to this guide to [deploy OpenWhisk using ElasticSearch](https://github.com/apache/openwhisk/blob/master/ansible/README.md#using-elasticsearch-to-store-activations).
 
 ### Deploying Using CouchDB
 -   Make sure your `db_local.ini` file is [setup for](#setup) CouchDB then execute:
@@ -332,7 +403,7 @@ The playbook structure allows you to clean, deploy or re-deploy a single compone
 
 ```shell script
 cd <openwhisk_home>
-gradle :core:invoker:distDocker -PdockerImageTag=myNewInvoker
+./gradlew :core:invoker:distDocker -PdockerImageTag=myNewInvoker
 ```
 Then all you need to do is re-deploy the invoker using the new image:
 

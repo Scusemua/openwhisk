@@ -1,3 +1,20 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.openwhisk.core.scheduler.queue.test
 
 import java.time.Instant
@@ -10,19 +27,23 @@ import com.sksamuel.elastic4s.http._
 import com.sksamuel.elastic4s.http.search.{SearchHits, SearchResponse}
 import com.sksamuel.elastic4s.searches.SearchRequest
 import common.StreamLogging
-import org.apache.kafka.clients.producer.RecordMetadata
-import org.apache.kafka.common.TopicPartition
 import org.apache.openwhisk.common.TransactionId
 import org.apache.openwhisk.common.WhiskInstants.InstantImplicits
 import org.apache.openwhisk.core.WhiskConfig
 import org.apache.openwhisk.core.ack.ActiveAck
-import org.apache.openwhisk.core.connector.{AcknowledegmentMessage, ActivationMessage, Message, MessageProducer}
+import org.apache.openwhisk.core.connector.{
+  AcknowledegmentMessage,
+  ActivationMessage,
+  Message,
+  MessageProducer,
+  ResultMetadata
+}
 import org.apache.openwhisk.core.database.UserContext
 import org.apache.openwhisk.core.database.elasticsearch.ElasticSearchActivationStore.generateIndex
 import org.apache.openwhisk.core.entity.ExecManifest.{ImageName, RuntimeManifest}
 import org.apache.openwhisk.core.entity.{WhiskActivation, _}
 import org.apache.openwhisk.core.etcd.EtcdKV.{ContainerKeys, QueueKeys, ThrottlingKeys}
-import org.apache.openwhisk.core.scheduler.SchedulerEndpoints
+import org.apache.openwhisk.core.scheduler.{SchedulerEndpoints, SchedulingConfig}
 import org.apache.openwhisk.core.scheduler.grpc.GetActivation
 import org.apache.openwhisk.core.scheduler.queue.ElasticSearchDurationChecker.{getFromDate, AverageAggregationName}
 import org.apache.openwhisk.core.scheduler.queue._
@@ -40,7 +61,7 @@ import org.apache.openwhisk.core.service.{
 }
 import org.scalamock.scalatest.MockFactory
 
-import scala.concurrent.duration.DurationInt
+import scala.concurrent.duration.{DurationInt}
 import scala.concurrent.{ExecutionContextExecutor, Future}
 import scala.language.{higherKinds, postfixOps}
 
@@ -64,6 +85,8 @@ class MemoryQueueTestsFixture
   val testInvocationNamespace = "test-invocation-namespace"
   val testNamespace = "test-namespace"
   val testAction = "test-action"
+
+  val schedulingConfig = SchedulingConfig(100.milliseconds, 100.milliseconds, 10.seconds, false, 1.5)
 
   val fqn = FullyQualifiedEntityName(EntityPath(testNamespace), EntityName(testAction), Some(SemVer(0, 0, 1)))
   val revision = DocRevision("1-testRev")
@@ -131,10 +154,12 @@ class MemoryQueueTestsFixture
   val actionThrottlingKey = ThrottlingKeys.action(testInvocationNamespace, fqn.copy(version = None))
 
   // queue variables
-  val queueConfig = QueueConfig(5 seconds, 10 seconds, 5 seconds, 5 seconds, 10, 10000, 0.9, 10)
+  val queueConfig = QueueConfig(5 seconds, 10 seconds, 5 seconds, 5 seconds, 10, 10000, 20000, 0.9, 10, false)
   val idleGrace = queueConfig.idleGrace
   val stopGrace = queueConfig.stopGrace
   val flushGrace = queueConfig.flushGrace
+  val retentionTimeout = queueConfig.maxRetentionMs
+  val blackboxTimeout = queueConfig.maxBlackboxRetentionMs
   val gracefulShutdownTimeout = queueConfig.gracefulShutdownTimeout
   val testRetentionSize = queueConfig.maxRetentionSize
   val testThrottlingFraction = queueConfig.throttlingFraction
@@ -188,11 +213,10 @@ class MemoryQueueTestsFixture
     override def sentCount(): Long = 0
 
     /** Sends msg to topic. This is an asynchronous operation. */
-    override def send(topic: String, msg: Message, retry: Int): Future[RecordMetadata] = {
+    override def send(topic: String, msg: Message, retry: Int): Future[ResultMetadata] = {
       receiver ! s"$topic-${msg}"
 
-      Future.successful(
-        new RecordMetadata(new TopicPartition(topic, 0), -1, -1, System.currentTimeMillis(), null, -1, -1))
+      Future.successful(ResultMetadata(topic, 0, -1))
     }
 
     /** Closes producer. */
